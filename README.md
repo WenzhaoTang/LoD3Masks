@@ -10,7 +10,7 @@ A lightweight Python tool to extract 2D mask images of building façades (with w
    Extract exterior and interior polygon coordinates for each `<bldg:WallSurface>`.
 
 2. **PCA Projection**  
-   Project 3D wall geometry into 2D via principal component analysis.
+   Project 3D wall geometry into 2D via PCA.
 
 3. **Shapely Processing**  
    Merge façade polygons into a single shape, group nearby openings (windows/doors), then subtract them to create holes.
