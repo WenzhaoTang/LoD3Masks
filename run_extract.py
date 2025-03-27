@@ -178,8 +178,8 @@ def process_gml_file(gml_path, output_dir):
     print(f"Finished processing file: {gml_path}")
 
 def main():
-    input_dir = "/home/tang/code/CityGML2OBJv2/data/tum2twin-datasets/citygml/lod3-building-datasets"
-    output_base_dir = "/home/tang/code/CityGML2OBJv2/mask_extraction_all"
+    input_dir = "data/tum2twin-datasets/citygml/lod3-building-datasets"
+    output_base_dir = "mask_extraction_all"
     os.makedirs(output_base_dir, exist_ok=True)
     gml_files = glob.glob(os.path.join(input_dir, "*.gml"))
     for gml_path in gml_files:
