@@ -17,7 +17,7 @@ conda activate lod3-mask-extraction
 
 To run the tool, first place your CityGML file in the `data` folder, then execute a command similar to:
 ```bash
-python main.py --input data/DEBY_LOD3_4959323.gml --output example_output/
+python run_extract.py --input data/DEBY_LOD3_4959323.gml --output example_output/
 ```
 
 
