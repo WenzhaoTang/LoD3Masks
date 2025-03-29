@@ -1,4 +1,4 @@
-name: relod3
+name: lod3-mask-extraction
 channels:
   - defaults
 dependencies:
@@ -186,4 +186,3 @@ dependencies:
       - yapf==0.43.0
       - yarl==1.15.2
       - zipp==3.20.2
-prefix: /home/tang/anaconda3/envs/relod3

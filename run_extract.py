@@ -1,12 +1,18 @@
 import os
+import sys
 import glob
+import argparse
 import numpy as np
 import xml.etree.ElementTree as ET
 from PIL import Image, ImageDraw
+from shapely.ops import unary_union
+from shapely.errors import GEOSException
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from shapely.ops import unary_union
+from multiprocessing import get_context
+
 from utils import (
+    parse_poslist,
     extract_polygon_exterior_3d,
     extract_polygon_interior_3d,
     extract_all_polygons_recursively,
@@ -15,179 +21,222 @@ from utils import (
     safe_intersects,
     safe_distance,
     debug_save_multi_polygon_2d,
-    group_polygons_by_proximity,
-    polygon_or_multipoly_to_2dcoords,
     compute_polygon_normal,
     define_axes_from_normal,
     project_points,
-    ns
+    ns,
+    SHIFT,
+    DEBUG,
+    MASK_TYPE
 )
 
-def process_wall(xml_bytes, debug_dir, output_dir):
+def process_wall(xml_bytes, out_dir, debug_dir):
     wall = ET.fromstring(xml_bytes)
     wall_id = wall.attrib.get("{http://www.opengis.net/gml}id", "unknown")
-    print(f"\n=== Processing WallSurface: {wall_id} ===")
-    facade_polygons_3d = extract_all_polygons_recursively(wall, ns)
-    if not facade_polygons_3d:
-        print(f"  No facade polygons found, skip {wall_id}")
+    
+    facade_polys_3d = extract_all_polygons_recursively(wall, ns)
+    if not facade_polys_3d:
         return wall_id
-    opening_polygons_3d = []
-    facade_poly_elems = wall.findall(".//gml:Polygon", ns)
-    for poly_elem in facade_poly_elems:
-        int_3d_list = extract_polygon_interior_3d(poly_elem)
-        if int_3d_list:
-            opening_polygons_3d.extend(int_3d_list)
-    for op_elem_tag in ["bldg:opening", "bldg:Door", "bldg:Window"]:
-        for op_elem in wall.findall(f".//{op_elem_tag}", ns):
-            polys_3d = extract_all_polygons_recursively(op_elem, ns)
-            opening_polygons_3d.extend(polys_3d)
-    normal = compute_polygon_normal(facade_polygons_3d[0])
+
+    opening_polys_3d = []
+    for poly in wall.findall(".//gml:Polygon", ns):
+        ints = extract_polygon_interior_3d(poly)
+        if ints:
+            opening_polys_3d.extend(ints)
+    for op in wall.findall(".//bldg:opening", ns):
+        opening_polys_3d.extend(extract_all_polygons_recursively(op, ns))
+    
+    door_polys_3d = []
+    for door in wall.findall(".//bldg:Door", ns):
+        d = extract_all_polygons_recursively(door, ns)
+        door_polys_3d.extend(d)
+        opening_polys_3d.extend(d)
+    window_polys_3d = []
+    for window in wall.findall(".//bldg:Window", ns):
+        w = extract_all_polygons_recursively(window, ns)
+        window_polys_3d.extend(w)
+        opening_polys_3d.extend(w)
+    
+    if not door_polys_3d and not window_polys_3d:
+        return wall_id
+
+    normal = compute_polygon_normal(facade_polys_3d[0])
     if normal is None:
-        print(f"  Invalid facade normal, skip {wall_id}")
         return wall_id
     axes = define_axes_from_normal(normal)
     if axes is None:
-        print(f"  Facade is nearly horizontal, skip {wall_id}")
         return wall_id
     x_axis, y_axis = axes
-    def project_3d(pts_3d):
-        return project_points(pts_3d, x_axis, y_axis)
-    debug_facade_2d_list = [project_3d(f3d) for f3d in facade_polygons_3d]
-    debug_opening_2d_list = [project_3d(o3d) for o3d in opening_polygons_3d]
-    debug_all_path = os.path.join(debug_dir, f"debug_{wall_id}_all_polygons.png")
-    debug_save_multi_polygon_2d(debug_facade_2d_list + debug_opening_2d_list, debug_all_path, scale=100)
-    facade_shapely_list = []
-    for f3d in facade_polygons_3d:
-        f2d = project_3d(f3d)
-        shp_f = to_shapely_polygon(f2d)
-        shp_f = safe_buffer0(shp_f)
-        if shp_f and not shp_f.is_empty:
-            facade_shapely_list.append(shp_f)
-    if not facade_shapely_list:
-        print(f"  Invalid facade polygons after projection, skip {wall_id}")
+
+    def project_3d(pts):
+        return project_points(pts, x_axis, y_axis)
+
+    # Save debug image if enabled
+    debug_facade_2d = [project_3d(pts) for pts in facade_polys_3d]
+    debug_opening_2d = [project_3d(pts) for pts in opening_polys_3d]
+    if DEBUG:
+        debug_all_path = os.path.join(debug_dir, f"debug_{wall_id}_all_polygons.png")
+        debug_save_multi_polygon_2d(debug_facade_2d + debug_opening_2d, debug_all_path, scale=100)
+
+    facade_shapes = []
+    for pts in facade_polys_3d:
+        pts2d = project_3d(pts)
+        shp = to_shapely_polygon(pts2d)
+        shp = safe_buffer0(shp)
+        if shp is not None and not shp.is_empty:
+            facade_shapes.append(shp)
+    if not facade_shapes:
         return wall_id
     try:
-        facade_polygon = unary_union(facade_shapely_list)
-        facade_polygon = safe_buffer0(facade_polygon)
-    except Exception as e:
-        print(f"  [Warning] union of facade polygons failed: {e}")
+        facade_union = unary_union(facade_shapes)
+        facade_union = safe_buffer0(facade_union)
+    except GEOSException:
         return wall_id
-    if not facade_polygon or facade_polygon.is_empty:
-        print(f"  Facade polygon is empty after union, skip {wall_id}")
+    if facade_union is None or facade_union.is_empty:
         return wall_id
-    opening_shapely_list = []
-    for op_3d in opening_polygons_3d:
-        op_2d = project_3d(op_3d)
-        shp_op = to_shapely_polygon(op_2d)
-        shp_op = safe_buffer0(shp_op)
-        if shp_op and not shp_op.is_empty:
-            opening_shapely_list.append(shp_op)
-    if not opening_shapely_list:
-        print(f"  No valid opening polygons for {wall_id}, output facade only.")
-        openings_union = None
-    else:
-        dist_threshold = 0.1
-        grouped_openings = group_polygons_by_proximity(opening_shapely_list, dist_thresh=dist_threshold)
-        if grouped_openings:
-            debug_grouped_2d = []
-            for g in grouped_openings:
-                if g.geom_type == "Polygon":
-                    debug_grouped_2d.append(np.array(g.exterior.coords))
-                elif g.geom_type == "MultiPolygon":
-                    for subg in g.geoms:
-                        debug_grouped_2d.append(np.array(subg.exterior.coords))
-            debug_grouped_path = os.path.join(debug_dir, f"debug_{wall_id}_grouped_openings.png")
-            debug_save_multi_polygon_2d(debug_grouped_2d, debug_grouped_path, scale=100)
-            try:
-                openings_union = unary_union(grouped_openings)
-                openings_union = safe_buffer0(openings_union)
-            except Exception as e:
-                print(f"  [Warning] union of grouped openings failed: {e}")
-                openings_union = None
-        else:
-            print(f"  No grouped openings after proximity, skip {wall_id}")
-            openings_union = None
-    if openings_union and not openings_union.is_empty:
+
+    min_xy_building = np.array([facade_union.bounds[0], facade_union.bounds[1]])
+    max_xy_building = np.array([facade_union.bounds[2], facade_union.bounds[3]])
+    scale_factor = 100
+    width_building = int((max_xy_building[0] - min_xy_building[0]) * scale_factor)
+    height_building = int((max_xy_building[1] - min_xy_building[1]) * scale_factor)
+    if width_building < 1 or height_building < 1:
+        return wall_id
+
+    def ring_to_pixels_building(coords):
+        pts = (np.array(coords) - min_xy_building) * scale_factor
+        pts_flipped = np.column_stack((width_building - pts[:, 0], height_building - pts[:, 1]))
+        return [tuple(p) for p in pts_flipped]
+
+    opening_shapes = []
+    for pts in opening_polys_3d:
+        pts2d = project_3d(pts)
+        shp = to_shapely_polygon(pts2d)
+        shp = safe_buffer0(shp)
+        if shp is not None and not shp.is_empty:
+            opening_shapes.append(shp)
+    if opening_shapes:
         try:
-            facade_with_holes = facade_polygon.difference(openings_union)
-            facade_with_holes = safe_buffer0(facade_with_holes)
-        except Exception as e:
-            print(f"  [Warning] difference failed: {e}")
-            facade_with_holes = facade_polygon
+            openings_union = unary_union(opening_shapes)
+            openings_union = safe_buffer0(openings_union)
+        except GEOSException:
+            openings_union = None
     else:
-        facade_with_holes = facade_polygon
-    if not facade_with_holes or facade_with_holes.is_empty:
-        print(f"  Facade with holes is empty, skip {wall_id}.")
-        return wall_id
-    if facade_with_holes.geom_type == "Polygon":
-        polygons_to_export = [facade_with_holes]
-    elif facade_with_holes.geom_type == "MultiPolygon":
-        polygons_to_export = list(facade_with_holes.geoms)
-    else:
-        polygons_to_export = []
-    all_rings_np = []
-    for poly_obj in polygons_to_export:
-        if poly_obj.exterior:
-            all_rings_np.append(np.array(poly_obj.exterior.coords))
-        for ring in poly_obj.interiors:
-            all_rings_np.append(np.array(ring.coords))
-    if not all_rings_np:
-        print(f"  No exterior ring in final geometry, skip {wall_id}")
-        return wall_id
-    all_rings_np = np.vstack(all_rings_np)
-    min_xy = np.min(all_rings_np, axis=0)
-    max_xy = np.max(all_rings_np, axis=0)
-    scale = 100
-    width = int((max_xy[0] - min_xy[0]) * scale)
-    height = int((max_xy[1] - min_xy[1]) * scale)
-    if width < 1 or height < 1:
-        print(f"  Invalid image size, skip {wall_id}")
-        return wall_id
-    mask = Image.new("L", (width, height), 0)
-    draw = ImageDraw.Draw(mask)
-    def ring_to_pixels(coords_2d):
-        px = (coords_2d - min_xy) * scale
-        px_flipped = np.column_stack((width - px[:, 0], height - px[:, 1]))
-        return [tuple(p) for p in px_flipped]
-    for poly_obj in polygons_to_export:
-        if poly_obj.exterior:
-            ext_coords = np.array(poly_obj.exterior.coords)
-            ext_pixels = ring_to_pixels(ext_coords)
-            draw.polygon(ext_pixels, fill=255)
-        for ring in poly_obj.interiors:
-            int_coords = np.array(ring.coords)
-            ring_pixels = ring_to_pixels(int_coords)
-            draw.polygon(ring_pixels, fill=0)
-    out_path = os.path.join(output_dir, f"mask_{wall_id}.png")
-    mask.save(out_path)
-    print(f"  ==> Saved final mask for wall {wall_id} to {out_path}")
+        openings_union = None
+
+    if (MASK_TYPE in ["all", "full"]) and (door_polys_3d or window_polys_3d):
+        full_mask_img = Image.new("RGB", (width_building, height_building), (0, 0, 0))
+        draw_full = ImageDraw.Draw(full_mask_img)
+        for pts in door_polys_3d:
+            pts2d = project_3d(pts)
+            pixel_pts = ring_to_pixels_building(pts2d)
+            draw_full.polygon(pixel_pts, fill=(255, 0, 0))
+        for pts in window_polys_3d:
+            pts2d = project_3d(pts)
+            pixel_pts = ring_to_pixels_building(pts2d)
+            draw_full.polygon(pixel_pts, fill=(0, 0, 255))
+        full_out_path = os.path.join(out_dir, f"mask_{wall_id}_full.png")
+        full_mask_img.save(full_out_path)
+
+    if (MASK_TYPE in ["all", "door"]) and door_polys_3d:
+        door_shapes = []
+        for pts in door_polys_3d:
+            pts2d = project_3d(pts)
+            shp = to_shapely_polygon(pts2d)
+            shp = safe_buffer0(shp)
+            if shp is not None and not shp.is_empty:
+                door_shapes.append(shp)
+        if door_shapes:
+            door_union = unary_union(door_shapes)
+            door_union = safe_buffer0(door_union)
+            if door_union is not None and not door_union.is_empty:
+                if door_union.geom_type == "Polygon":
+                    door_polys = [door_union]
+                elif door_union.geom_type == "MultiPolygon":
+                    door_polys = list(door_union.geoms)
+                else:
+                    door_polys = []
+                door_mask_img = Image.new("L", (width_building, height_building), 0)
+                door_draw = ImageDraw.Draw(door_mask_img)
+                for poly in door_polys:
+                    if poly.exterior is not None:
+                        door_draw.polygon(ring_to_pixels_building(poly.exterior.coords), fill=255)
+                    for ring in poly.interiors:
+                        door_draw.polygon(ring_to_pixels_building(ring.coords), fill=0)
+                door_out_path = os.path.join(out_dir, f"mask_{wall_id}_door.png")
+                door_mask_img.save(door_out_path)
+    
+    if (MASK_TYPE in ["all", "window"]) and window_polys_3d:
+        window_shapes = []
+        for pts in window_polys_3d:
+            pts2d = project_3d(pts)
+            shp = to_shapely_polygon(pts2d)
+            shp = safe_buffer0(shp)
+            if shp is not None and not shp.is_empty:
+                window_shapes.append(shp)
+        if window_shapes:
+            window_union = unary_union(window_shapes)
+            window_union = safe_buffer0(window_union)
+            if window_union is not None and not window_union.is_empty:
+                if window_union.geom_type == "Polygon":
+                    window_polys = [window_union]
+                elif window_union.geom_type == "MultiPolygon":
+                    window_polys = list(window_union.geoms)
+                else:
+                    window_polys = []
+                window_mask_img = Image.new("L", (width_building, height_building), 0)
+                window_draw = ImageDraw.Draw(window_mask_img)
+                for poly in window_polys:
+                    if poly.exterior is not None:
+                        window_draw.polygon(ring_to_pixels_building(poly.exterior.coords), fill=255)
+                    for ring in poly.interiors:
+                        window_draw.polygon(ring_to_pixels_building(ring.coords), fill=0)
+                window_out_path = os.path.join(out_dir, f"mask_{wall_id}_window.png")
+                window_mask_img.save(window_out_path)
+    
     return wall_id
 
-def process_gml_file(gml_path, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    debug_dir = os.path.join(output_dir, "debug_masks")
-    os.makedirs(debug_dir, exist_ok=True)
+def process_building(building, building_out_dir, building_debug_dir):
+    building_id = building.attrib.get("{http://www.opengis.net/gml}id", "unknown_building")
+    os.makedirs(building_out_dir, exist_ok=True)
+    wall_elements = building.findall(".//bldg:WallSurface", ns)
+    if not wall_elements:
+        return
+    ctx = get_context('fork')
+    with ProcessPoolExecutor(max_workers=os.cpu_count(), mp_context=ctx) as exe:
+        futures = [exe.submit(process_wall, ET.tostring(w), building_out_dir, building_out_dir)
+                   for w in wall_elements]
+        for _ in tqdm(as_completed(futures), total=len(futures)):
+            pass
+
+def process_gml_file(gml_path, output_base_dir):
     tree = ET.parse(gml_path)
     root = tree.getroot()
-    walls = root.findall(".//bldg:WallSurface", ns)
-    xml_list = [ET.tostring(w) for w in walls]
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as exe:
-        futures = [exe.submit(process_wall, xml, debug_dir, output_dir) for xml in xml_list]
-        for _ in tqdm(as_completed(futures), total=len(futures), desc=f"Processing {os.path.basename(gml_path)}"):
-            pass
-    print(f"Finished processing file: {gml_path}")
+    buildings = root.findall(".//bldg:Building", ns)
+    for building in buildings:
+        building_id = building.attrib.get("{http://www.opengis.net/gml}id", "unknown_building")
+        building_out_dir = os.path.join(output_base_dir, building_id)
+        process_building(building, building_out_dir, building_out_dir)
 
 def main():
-    input_dir = "data/tum2twin-datasets/citygml/lod3-building-datasets"
-    output_base_dir = "mask_extraction_all"
+    parser = argparse.ArgumentParser(description="CityGML Mask Extraction Tool")
+    parser.add_argument("--input", required=True,
+                        help="Path to input CityGML file or directory containing .gml files")
+    parser.add_argument("--output", required=True,
+                        help="Output directory for mask images")
+    args = parser.parse_args()
+
+    input_path = args.input
+    output_base_dir = args.output
     os.makedirs(output_base_dir, exist_ok=True)
-    gml_files = glob.glob(os.path.join(input_dir, "*.gml"))
+
+    if os.path.isdir(input_path):
+        gml_files = glob.glob(os.path.join(input_path, "*.gml"))
+    else:
+        gml_files = [input_path]
+
     for gml_path in gml_files:
-        base_name = os.path.splitext(os.path.basename(gml_path))[0]
-        output_dir = os.path.join(output_base_dir, base_name)
-        print(f"\n=== Processing file: {gml_path} ===")
-        process_gml_file(gml_path, output_dir)
-        print(f"=== Finished processing file: {gml_path} ===\n")
+        process_gml_file(gml_path, output_base_dir)
 
 if __name__ == "__main__":
     main()

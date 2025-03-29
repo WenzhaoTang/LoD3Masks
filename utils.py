@@ -6,10 +6,14 @@ from shapely.geometry import Polygon, MultiPolygon
 from shapely.ops import unary_union
 from shapely.errors import GEOSException
 
+DEBUG = True
+MASK_TYPE = "all" # "all", "door", "window", "full"
+
+# Convention from Scan2LoD3
 SHIFT = np.array([690729.0567, 5335897.0603, 500.0])
 ns = {
-    "bldg": "http://www.opengis.net/citygml/building/2.0",
-    "gml": "http://www.opengis.net/gml"
+    'bldg': 'http://www.opengis.net/citygml/building/2.0',
+    'gml': 'http://www.opengis.net/gml'
 }
 
 def parse_poslist(poslist_str):
@@ -21,39 +25,38 @@ def extract_polygon_exterior_3d(poly_elem):
     ext = poly_elem.find("gml:exterior", ns)
     if ext is None:
         return None
-    linring = ext.find("gml:LinearRing", ns)
-    if linring is None:
+    lr = ext.find("gml:LinearRing", ns)
+    if lr is None:
         return None
-    pos_elem = linring.find("gml:posList", ns)
+    pos_elem = lr.find("gml:posList", ns)
     if pos_elem is None or not pos_elem.text.strip():
         return None
-    pts_3d = parse_poslist(pos_elem.text)
-    if pts_3d.shape[0] < 3:
+    pts = parse_poslist(pos_elem.text)
+    if pts.shape[0] < 3:
         return None
-    return pts_3d
+    return pts
 
 def extract_polygon_interior_3d(poly_elem):
     interiors = []
     for interior in poly_elem.findall("gml:interior", ns):
-        linring = interior.find("gml:LinearRing", ns)
-        if linring is None:
+        lr = interior.find("gml:LinearRing", ns)
+        if lr is None:
             continue
-        pos_elem = linring.find("gml:posList", ns)
+        pos_elem = lr.find("gml:posList", ns)
         if pos_elem is None or not pos_elem.text.strip():
             continue
-        pts_3d = parse_poslist(pos_elem.text)
-        if pts_3d is not None and len(pts_3d) >= 3:
-            interiors.append(pts_3d)
+        pts = parse_poslist(pos_elem.text)
+        if pts is not None and len(pts) >= 3:
+            interiors.append(pts)
     return interiors
 
 def extract_all_polygons_recursively(elem, ns):
-    polygons_3d = []
-    poly_elems = elem.findall(".//gml:Polygon", ns)
-    for p in poly_elems:
-        ext_3d = extract_polygon_exterior_3d(p)
-        if ext_3d is not None and len(ext_3d) >= 3:
-            polygons_3d.append(ext_3d)
-    return polygons_3d
+    polygons = []
+    for p in elem.findall(".//gml:Polygon", ns):
+        pts = extract_polygon_exterior_3d(p)
+        if pts is not None and len(pts) >= 3:
+            polygons.append(pts)
+    return polygons
 
 def to_shapely_polygon(points_2d):
     if len(points_2d) < 3:
@@ -88,10 +91,7 @@ def safe_distance(a, b):
 def debug_save_multi_polygon_2d(polygons_2d, out_path, scale=100):
     if not polygons_2d:
         return
-    all_pts = []
-    for pts in polygons_2d:
-        if pts is not None and len(pts) >= 3:
-            all_pts.append(pts)
+    all_pts = [pts for pts in polygons_2d if pts is not None and len(pts) >= 3]
     if not all_pts:
         return
     all_pts_np = np.vstack(all_pts)
@@ -113,63 +113,6 @@ def debug_save_multi_polygon_2d(polygons_2d, out_path, scale=100):
         c = color_list[i % len(color_list)]
         draw.polygon(px_list, fill=c)
     img.save(out_path)
-
-def group_polygons_by_proximity(polygons, dist_thresh=0.1):
-    fixed_polys = []
-    for p in polygons:
-        fp = safe_buffer0(p)
-        if fp and not fp.is_empty and fp.area > 0:
-            fixed_polys.append(fp)
-    n = len(fixed_polys)
-    if n == 0:
-        return []
-    adj = [[] for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            pi = fixed_polys[i]
-            pj = fixed_polys[j]
-            if safe_intersects(pi, pj) or (safe_distance(pi, pj) < dist_thresh):
-                adj[i].append(j)
-                adj[j].append(i)
-    visited = [False] * n
-    groups = []
-    for i in range(n):
-        if not visited[i]:
-            queue = [i]
-            visited[i] = True
-            comp = [i]
-            while queue:
-                cur = queue.pop()
-                for nxt in adj[cur]:
-                    if not visited[nxt]:
-                        visited[nxt] = True
-                        queue.append(nxt)
-                        comp.append(nxt)
-            groups.append(comp)
-    grouped_polys = []
-    for comp in groups:
-        sublist = [fixed_polys[k] for k in comp]
-        try:
-            unioned = unary_union(sublist)
-            if not unioned.is_empty:
-                grouped_polys.append(safe_buffer0(unioned))
-        except GEOSException:
-            pass
-    result = [g for g in grouped_polys if g and not g.is_empty and g.area > 0]
-    return result
-
-def polygon_or_multipoly_to_2dcoords(geom):
-    if geom is None or geom.is_empty:
-        return []
-    if geom.geom_type == "Polygon":
-        return [np.array(geom.exterior.coords)]
-    elif geom.geom_type == "MultiPolygon":
-        arrs = []
-        for g in geom.geoms:
-            if g.exterior:
-                arrs.append(np.array(g.exterior.coords))
-        return arrs
-    return []
 
 def compute_polygon_normal(points_3d):
     if len(points_3d) < 3:
@@ -197,9 +140,4 @@ def define_axes_from_normal(facade_normal):
     return x_axis, y_axis
 
 def project_points(points_3d, x_axis, y_axis):
-    projected_2d = []
-    for p in points_3d:
-        x = np.dot(p, x_axis)
-        y = np.dot(p, y_axis)
-        projected_2d.append([x, y])
-    return np.array(projected_2d)
+    return np.column_stack((points_3d.dot(x_axis), points_3d.dot(y_axis)))
